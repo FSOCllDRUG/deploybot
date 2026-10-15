@@ -19,6 +19,7 @@ case "$*" in
   "compose logs"*) echo "app-1  | started" ;;
   "stats"*) printf 'zapasik-app-1\\t0.5%%\\t180MiB / 7.6GiB\\n' ;;
   "ps --all"*) printf '%s\\n' "$ALL_JSON" ;;
+  "ps -a") echo "CONTAINER ID   IMAGE         STATUS       NAMES" ; echo "abc123         zapasik-app   Up 2 hours   zapasik-app-1" ;;
   "system df"*) printf '%s\\n' '{"Type":"Images","Size":"2.137GB","Reclaimable":"1.2GB (56%)"}' ;;
 esac
 exit "${DOCKER_EXIT:-0}"
@@ -42,6 +43,7 @@ class Server:
         self.project = Project("zapasik", self.clone, check=["app"], restart=["app"], on_change=[("Caddyfile", ["restart", "caddy"])])
         monkeypatch.setattr(deploybot, "PROJECTS", {"zapasik": self.project})
         monkeypatch.setattr(deploybot, "ADMINS", {1})
+        monkeypatch.setattr(deploybot, "STATE", tmp_path / "state" / "state.json")
 
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -227,3 +229,27 @@ def test_long_message_goes_as_file_and_buttons_get_colours(monkeypatch):
     deploybot.send(1, "ok?", [("Обновить", "do:update:zapasik"), ("Отмена", "cancel")])
     buttons = [row[0] for row in calls[-1][1]["reply_markup"]["inline_keyboard"]]
     assert buttons[0]["style"] == "success" and "style" not in buttons[1]
+
+
+def test_terminal_view_is_remembered_per_chat(server, monkeypatch):
+    run_now = lambda chat, fn, *a: fn(*a)
+    monkeypatch.setattr(deploybot, "in_background", run_now)
+    monkeypatch.setattr(deploybot, "api", lambda *a, **kw: None)
+    msg = lambda text: {"message": {"from": {"id": 1}, "chat": {"id": 1, "type": "private"}, "text": text}}
+    press = lambda data: {"callback_query": {"id": "q", "from": {"id": 1}, "data": data, "message": {"chat": {"id": 1}, "message_id": 3}}}
+
+    deploybot.handle(msg(deploybot.VIEW))
+    assert [b for _, b in server.sent[-1][2]] == ["view:pretty", "view:raw"] and server.sent[-1][2][0][0] == "✓ Красиво"
+    deploybot.handle(press("view:raw"))
+    assert server.sent[-1] == ("edit", "Вид: Как в терминале") and deploybot.view(1) == "raw" and deploybot.view(2) == "pretty"
+    assert json.loads(deploybot.STATE.read_text()) == {"1": "raw"}
+
+    deploybot.handle(msg(deploybot.STATUS))
+    text = server.sent[-1][1]
+    assert text.startswith("<pre># zapasik:") and "$ git status -sb" in text and "$ docker compose ps" in text and "$ free -h" in text
+    deploybot.handle(msg(deploybot.DOCKER))
+    assert "$ docker ps -a\nCONTAINER ID" in server.sent[-1][1] and "<b>" not in server.sent[-1][1]
+
+    server.push("app.py", "x = 4\n", "Raw commit")
+    deploybot.ask_update(1, server.project)
+    assert server.sent[-1][1].startswith("<pre>$ git log --oneline HEAD..@{u}\n") and "Raw commit" in server.sent[-1][1]

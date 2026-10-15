@@ -29,17 +29,20 @@ from datetime import datetime
 from pathlib import Path
 
 CONFIG = Path(os.environ.get("DEPLOYBOT_CONFIG", "/etc/deploybot/projects.ini"))
+STATE = Path(os.environ.get("DEPLOYBOT_STATE", "/var/lib/deploybot/state.json"))  # per-chat view choice
 HERE = Path(__file__).resolve().parent
 STATUS, UPDATE, LOGS, RESTART = "📊 Состояние", "⬆️ Обновить", "📄 Логи", "🔄 Перезапуск"
-DOCKER, HOST = "🐳 Docker", "🖥 Сервер"
-KEYBOARD = {"keyboard": [[{"text": t} for t in row] for row in ((STATUS, UPDATE), (LOGS, RESTART), (DOCKER, HOST))],
+DOCKER, HOST, VIEW = "🐳 Docker", "🖥 Сервер", "⚙️ Вид"
+KEYBOARD = {"keyboard": [[{"text": t} for t in row] for row in ((STATUS, UPDATE), (LOGS, RESTART), (DOCKER, HOST), (VIEW,))],
             "resize_keyboard": True, "is_persistent": True}
 HELP = ("<b>{server}</b>\n\n"
         f"{STATUS} — версии проектов и их контейнеры\n"
         f"{UPDATE} — покажу новые коммиты и обновлю после подтверждения\n"
         f"{LOGS} — логи контейнеров файлом\n{RESTART} — перезапустить приложение\n"
         f"{DOCKER} — все контейнеры сервера и место, которое занимает Docker\n"
-        f"{HOST} — процессор, память, диск, кто больше всех ест память")
+        f"{HOST} — процессор, память, диск, кто больше всех ест память\n"
+        f"{VIEW} — красиво или как в терминале")
+VIEW_NAMES = {"pretty": "Красиво", "raw": "Как в терминале"}
 # Bot API 9.4 button colours; older clients just ignore the field.
 STYLES = {"do:update": "success", "do:restart": "danger"}
 
@@ -317,6 +320,62 @@ def server_text() -> str:
     return "\n".join(lines)
 
 
+# ---------- «как в терминале»: the commands' own output, nothing added ----------
+
+def pre(*transcripts: str) -> str:
+    return "<pre>" + html.escape("\n".join(t.rstrip() for t in transcripts)) + "</pre>"
+
+
+def head(transcript: str, lines: int) -> str:
+    return "\n".join(transcript.splitlines()[:lines + 1])  # + the «$ command» line
+
+
+def status_raw() -> str:
+    parts = []
+    for p in PROJECTS.values():
+        sh(p, "git", "fetch", "-q")
+        parts += [f"# {p.name}: {p.dir}", sh(p, "git", "log", "-1", "--oneline")[1], sh(p, "git", "status", "-sb")[1]]
+        if not p.is_self:
+            parts.append(sh(p, "docker", "compose", "ps")[1])
+        parts.append("")
+    return pre(*parts, sh(None, "free", "-h")[1], sh(None, "df", "-h", "/")[1])
+
+
+def docker_raw() -> str:
+    return pre(sh(None, "docker", "ps", "-a")[1], sh(None, "docker", "stats", "--no-stream")[1], sh(None, "docker", "system", "df")[1])
+
+
+def server_raw() -> str:
+    return pre(sh(None, "uptime")[1], sh(None, "free", "-h")[1], sh(None, "df", "-h", "/")[1],
+               head(sh(None, "ps", "-eo", "pid,rss,comm", "--sort=-rss")[1], 6))
+
+
+def view(chat: int) -> str:
+    try:
+        return json.loads(STATE.read_text()).get(str(chat), "pretty")
+    except (OSError, ValueError):
+        return "pretty"
+
+
+def set_view(chat: int, mode: str) -> None:
+    try:
+        data = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data[str(chat)] = mode
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(STATE)  # atomic: a crash never leaves half a file
+
+
+def ask_view(chat: int) -> None:
+    now = view(chat)
+    send(chat, f"Как показывать ответы? Сейчас: {VIEW_NAMES[now]}.\n\n«Как в терминале» — вывод самих команд "
+               "(<code>docker ps -a</code>, <code>free -h</code>…) без украшений.",
+         [(("✓ " if k == now else "") + name, f"view:{k}") for k, name in VIEW_NAMES.items()])
+
+
 def logs_text(p: Project, tail: int = 2000) -> str:
     return sh(p, "docker", "compose", "logs", "--no-color", "--timestamps", f"--tail={tail}", timeout=60)[1]
 
@@ -331,8 +390,11 @@ def show_logs(chat: int, p: Project) -> None:
 
 def ask_update(chat: int, p: Project) -> None:
     sh(p, "git", "fetch", "-q")
-    commits = out(p, "git", "log", "--format=%h %s", "HEAD..@{u}").splitlines()
-    if commits:
+    ok, log = sh(p, "git", "log", "--oneline", "HEAD..@{u}")
+    commits = log.splitlines()[1:] if ok else []
+    if commits and view(chat) == "raw":
+        send(chat, pre(log), [("Обновить", f"do:update:{p.name}"), ("Отмена", "cancel")])
+    elif commits:
         rows = "\n".join(f"<code>{h}</code> {html.escape(subject)}" for h, _, subject in (c.partition(" ") for c in commits))
         send(chat, f"📦 <b>{p.name}</b>: новых коммитов {len(commits)}\n<blockquote expandable>{rows}</blockquote>",
              [("Обновить", f"do:update:{p.name}"), ("Отмена", "cancel")])
@@ -413,7 +475,7 @@ def in_background(chat: int, fn, *args) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
-VIEWS = {STATUS: status_text, DOCKER: docker_text, HOST: server_text}
+VIEWS = {STATUS: (status_text, status_raw), DOCKER: (docker_text, docker_raw), HOST: (server_text, server_raw)}
 ASK = {UPDATE: ask_update, LOGS: show_logs, RESTART: ask_restart}  # need a project
 JOBS = {"update": update, "restart": restart}
 
@@ -435,7 +497,10 @@ def handle(u: dict) -> None:
             return
         chat, text = m["chat"]["id"], m.get("text", "")
         if text in VIEWS:
-            in_background(chat, lambda: send(chat, VIEWS[text]()))
+            render = VIEWS[text][view(chat) == "raw"]
+            in_background(chat, lambda: send(chat, render()))
+        elif text == VIEW:
+            in_background(chat, ask_view, chat)
         elif text in ASK:
             in_background(chat, choose, chat, text)
         else:
@@ -448,7 +513,10 @@ def handle(u: dict) -> None:
         kind, _, rest = q.get("data", "").partition(":")
         action, _, name = rest.partition(":")
         p = PROJECTS.get(name)
-        if kind == "ask" and p:
+        if kind == "view" and rest in VIEW_NAMES:
+            set_view(chat, rest)
+            edit(chat, message_id, f"Вид: {VIEW_NAMES[rest]}")
+        elif kind == "ask" and p:
             edit(chat, message_id, p.name)  # drops the buttons
             asks = {"update": ask_update, "logs": show_logs, "restart": ask_restart}
             in_background(chat, asks[action], chat, p)
