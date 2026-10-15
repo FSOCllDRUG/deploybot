@@ -66,7 +66,7 @@ busy: dict[str, threading.Lock] = {}  # per project: one update or restart at a 
 
 
 def load(path: Path = CONFIG) -> tuple[str, set[int], dict[str, Project], str]:
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))  # «check = app  # comment» works
     if not cfg.read(path, encoding="utf-8"):
         sys.exit(f"Нет конфига {path}, пример: projects.example.ini")
     bot = cfg["bot"]

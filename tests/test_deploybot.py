@@ -143,6 +143,8 @@ def test_config(tmp_path):
     assert server == "germany vps" and admins == {111111111} and list(projects) == ["zapasik", "deploybot"]
     z = projects["zapasik"]
     assert (z.check, z.restart, z.on_change) == (["app"], ["app"], [("Caddyfile", ["restart", "caddy"])])
+    ini.write_text("[bot]\ntoken = t\nadmins = 1  # me\n[blog]\ndir = /root/blog\ncheck = web          # must run\n")
+    assert deploybot.load(ini)[2]["blog"].check == ["web"] and deploybot.load(ini)[1] == {1}
     ini.write_text("[bot]\ntoken = t\nadmins = 1\n[Bad Name]\ndir = /x\n")
     with pytest.raises(SystemExit):
         deploybot.load(ini)
