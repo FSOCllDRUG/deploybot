@@ -18,6 +18,8 @@ case "$*" in
   "compose ps"*) printf '%s\\n' "$PS_JSON" ;;
   "compose logs"*) echo "app-1  | started" ;;
   "stats"*) printf 'zapasik-app-1\\t0.5%%\\t180MiB / 7.6GiB\\n' ;;
+  "ps --all"*) printf '%s\\n' "$ALL_JSON" ;;
+  "system df"*) printf '%s\\n' '{"Type":"Images","Size":"2.137GB","Reclaimable":"1.2GB (56%)"}' ;;
 esac
 exit "${DOCKER_EXIT:-0}"
 """
@@ -112,7 +114,7 @@ def test_restart(server):
 def test_status(server):
     server.push("app.py", "x = 3\n", "Pending")
     text = deploybot.status_text()
-    assert "Новых коммитов: 1" in text and "🟢 app — Up 2 hours · 0.5% · 180MiB / 7.6GiB" in text and "ГБ" in text
+    assert "Новых коммитов: 1" in text and "🟢 <b>app</b> · работает 2 ч · CPU 0,5% · 180 МБ" in text and "💾 Память" in text
 
 
 def test_self_update_restarts_the_bot(server, monkeypatch):
@@ -185,3 +187,43 @@ def test_projects_update_independently(server, tmp_path):
     deploybot.exclusive(lambda chat, mid, p: server.sent.append(("ran", p.name)), 1, 5, other)
     lock.release()
     assert server.sent == [("edit", "zapasik: уже идёт обновление или перезапуск, дождитесь его."), ("ran", "blog")]
+
+
+def test_russian_docker_words():
+    assert deploybot.ru_status("Up 6 minutes (healthy)") == "работает 6 мин · здоров"
+    assert deploybot.ru_status("Up About an hour") == "работает ~1 ч"
+    assert deploybot.ru_status("Exited (137) 2 days ago") == "остановлен, код 137, 2 дн назад"
+    assert deploybot.ru_status("Restarting (1) 5 seconds ago") == "перезапускается, код 1"
+    assert deploybot.ru_status("22 minutes ago") == "22 мин назад"
+    assert deploybot.ru_size("212.8MiB") == "213 МБ" and deploybot.ru_size("1.2GB (56%)") == "1,2 ГБ (56%)"
+    assert deploybot.ru_size("0B") == "0 Б" and deploybot.num(1.0) == "1"
+
+
+def test_docker_view_groups_all_containers(server, monkeypatch):
+    rows = [
+        {"Names": "zapasik-app-1", "State": "running", "Status": "Up 2 hours", "Image": "zapasik-app",
+         "Labels": "com.docker.compose.project=zapasik,com.docker.compose.service=app"},
+        {"Names": "old-db", "State": "exited", "Status": "Exited (0) 3 weeks ago", "Image": "postgres:16", "Labels": ""},
+    ]
+    monkeypatch.setenv("ALL_JSON", "\n".join(json.dumps(r) for r in rows))
+    text = deploybot.docker_text()
+    assert "Работают 1 из 2" in text and "📦 <b>zapasik</b>" in text and "📦 <b>без compose</b>" in text
+    assert "🟢 <b>zapasik-app-1</b> · работает 2 ч · CPU 0,5% · 180 МБ" in text
+    assert "⚪ <b>old-db</b> · остановлен, код 0, 3 нед назад" in text
+    assert "Образы: 2,1 ГБ, можно освободить 1,2 ГБ (56%)" in text
+
+
+def test_server_view():
+    text = deploybot.server_text()
+    assert "⚙️ <b>Процессор</b>" in text and "🧠 <b>Память</b>" in text
+    assert "💽 <b>Диск /</b>" in text and "<blockquote expandable>" in text
+
+
+def test_long_message_goes_as_file_and_buttons_get_colours(monkeypatch):
+    calls = []
+    monkeypatch.setattr(deploybot, "api", lambda method, data=None, file=None: calls.append((method, data, file)) or {"message_id": 7})
+    deploybot.send(1, "<b>x</b>" * 1000)
+    assert calls[-1][0] == "sendDocument" and calls[-1][2][1].startswith(b"xxx")
+    deploybot.send(1, "ok?", [("Обновить", "do:update:zapasik"), ("Отмена", "cancel")])
+    buttons = [row[0] for row in calls[-1][1]["reply_markup"]["inline_keyboard"]]
+    assert buttons[0]["style"] == "success" and "style" not in buttons[1]

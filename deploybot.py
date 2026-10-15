@@ -31,12 +31,17 @@ from pathlib import Path
 CONFIG = Path(os.environ.get("DEPLOYBOT_CONFIG", "/etc/deploybot/projects.ini"))
 HERE = Path(__file__).resolve().parent
 STATUS, UPDATE, LOGS, RESTART = "📊 Состояние", "⬆️ Обновить", "📄 Логи", "🔄 Перезапуск"
-KEYBOARD = {"keyboard": [[{"text": STATUS}, {"text": UPDATE}], [{"text": LOGS}, {"text": RESTART}]],
+DOCKER, HOST = "🐳 Docker", "🖥 Сервер"
+KEYBOARD = {"keyboard": [[{"text": t} for t in row] for row in ((STATUS, UPDATE), (LOGS, RESTART), (DOCKER, HOST))],
             "resize_keyboard": True, "is_persistent": True}
 HELP = ("<b>{server}</b>\n\n"
-        f"{STATUS} — версии, контейнеры, память и диск\n"
+        f"{STATUS} — версии проектов и их контейнеры\n"
         f"{UPDATE} — покажу новые коммиты и обновлю после подтверждения\n"
-        f"{LOGS} — логи контейнеров файлом\n{RESTART} — перезапустить приложение")
+        f"{LOGS} — логи контейнеров файлом\n{RESTART} — перезапустить приложение\n"
+        f"{DOCKER} — все контейнеры сервера и место, которое занимает Docker\n"
+        f"{HOST} — процессор, память, диск, кто больше всех ест память")
+# Bot API 9.4 button colours; older clients just ignore the field.
+STYLES = {"do:update": "success", "do:restart": "danger"}
 
 
 @dataclass
@@ -104,8 +109,12 @@ def api(method: str, data: dict | None = None, file: tuple[str, bytes] | None = 
 
 
 def send(chat: int, text: str, buttons: list[tuple[str, str]] | None = None) -> int:
-    markup = {"inline_keyboard": [[{"text": t, "callback_data": d}] for t, d in buttons]} if buttons else KEYBOARD
-    return api("sendMessage", {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "reply_markup": markup})["message_id"]
+    if len(text) > 4000:  # cutting HTML would break its tags: the whole text goes as a file instead
+        send_file(chat, f"message-{stamp()}.txt", html.unescape(re.sub(r"<[^>]+>", "", text)), "Сообщение длинное, отправил файлом")
+        return 0
+    markup = {"inline_keyboard": [[dict({"text": t, "callback_data": d}, **({"style": STYLES[d[:d.rfind(":")]]} if d[:d.rfind(":")] in STYLES else {}))]
+                                  for t, d in buttons]} if buttons else KEYBOARD
+    return api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": markup})["message_id"]
 
 
 def edit(chat: int, message_id: int, text: str) -> None:
@@ -118,11 +127,11 @@ def send_file(chat: int, name: str, text: str, caption: str = "") -> None:
 
 # ---------- server ----------
 
-def sh(p: Project, *cmd: str, timeout: int = 120) -> tuple[bool, str]:
-    """Runs a command in the project's folder; returns (ok, transcript with the command line)."""
+def sh(p: Project | None, *cmd: str, timeout: int = 120) -> tuple[bool, str]:
+    """Runs a command in the project's folder (None: anywhere); returns (ok, transcript with the command line)."""
     head = f"$ {' '.join(cmd)}\n"
     try:
-        r = subprocess.run(cmd, cwd=p.dir, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, cwd=p.dir if p else None, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f"{head}прервано: дольше {timeout} с\n"
     except OSError as e:
@@ -130,7 +139,7 @@ def sh(p: Project, *cmd: str, timeout: int = 120) -> tuple[bool, str]:
     return r.returncode == 0, head + r.stdout + r.stderr
 
 
-def out(p: Project, *cmd: str) -> str:
+def out(p: Project | None, *cmd: str) -> str:
     return sh(p, *cmd)[1].split("\n", 1)[1].strip()
 
 
@@ -156,8 +165,13 @@ def wait_healthy(p: Project, seconds: int = 20) -> bool:
     return healthy(p)
 
 
+def num(x: float) -> str:
+    text = f"{x:.0f}" if x >= 100 else f"{x:.1f}".replace(".0", "") if f"{x:.1f}".endswith(".0") else f"{x:.1f}"
+    return text.replace(".", ",")
+
+
 def gb(n: float) -> str:
-    return f"{n / 2**30:.1f}".replace(".", ",")
+    return num(n / 2**30)
 
 
 def duration(seconds: float) -> str:
@@ -165,37 +179,142 @@ def duration(seconds: float) -> str:
     return f"{m} мин {s} с" if m else f"{s} с"
 
 
+def uptime(seconds: float) -> str:
+    d, rest = divmod(int(seconds), 86400)
+    h, m = rest // 3600, rest % 3600 // 60
+    return f"{d} дн {h} ч" if d else f"{h} ч {m} мин" if h else f"{m} мин"
+
+
 def stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+
+_SIZE_UNITS = {"B": "Б", "kB": "КБ", "KiB": "КБ", "MB": "МБ", "MiB": "МБ", "GB": "ГБ", "GiB": "ГБ", "TB": "ТБ", "TiB": "ТБ"}
+
+
+def ru_size(text: str) -> str:
+    """Docker sizes: «212.8MiB» → «213 МБ», «1.2GB (55%)» → «1,2 ГБ (55%)»."""
+    return re.sub(r"([\d.]+)\s*(kB|[KMGT]i?B|B)\b", lambda m: f"{num(float(m[1]))} {_SIZE_UNITS.get(m[2], m[2])}", text)
+
+
+_RU_TIME = [(r"About an? hour", "~1 ч"), (r"About a minute", "~1 мин"), (r"Less than a second", "<1 с"),
+            (r"(\d+) seconds?", r"\1 с"), (r"(\d+) minutes?", r"\1 мин"), (r"(\d+) hours?", r"\1 ч"),
+            (r"(\d+) days?", r"\1 дн"), (r"(\d+) weeks?", r"\1 нед"), (r"(\d+) months?", r"\1 мес"),
+            (r"(\d+) years?", r"\1 г"), (r"\bago\b", "назад")]
+_RU_STATUS = [(r"^Up ", "работает "), (r"^Exited \((\d+)\) (.*)", r"остановлен, код \1, \2"),
+              (r"^Restarting \((\d+)\).*", r"перезапускается, код \1"), (r"^Created$", "создан, не запущен"),
+              (r"\(healthy\)", "· здоров"), (r"\(unhealthy\)", "· нездоров"), (r"\(health: starting\)", "· проверка здоровья"),
+              (r"\(Paused\)", "· на паузе")]
+
+
+def ru_status(text: str) -> str:
+    """Docker's English «Up 6 minutes (healthy)» → «работает 6 мин · здоров»; unknown parts pass through."""
+    for pattern, repl in _RU_TIME + _RU_STATUS:
+        text = re.sub(pattern, repl, text)
+    return text
+
+
+def docker_stats() -> dict[str, str]:
+    """Container name → «CPU 0,6% · 213 МБ» (memory limit dropped: without one it is just the server's RAM)."""
+    ok, text = sh(None, "docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
+    stats = {}
+    for row in text.splitlines()[1:] if ok else []:
+        name, cpu, mem_usage = (row.split("\t") + ["", ""])[:3]
+        stats[name] = f"CPU {cpu.replace('.', ',')} · {ru_size(mem_usage.split(' / ')[0])}"
+    return stats
+
+
+def container_line(name: str, state: str, status: str, stats: str = "") -> str:
+    icon = ("🟢" if state == "running" and "unhealthy" not in status
+            else "⚪" if status.startswith("Exited (0)")  # finished cleanly, e.g. a one-off migration
+            else "🟡" if state in ("restarting", "created", "paused") else "🔴")
+    return f"{icon} <b>{html.escape(name)}</b> · {html.escape(ru_status(status or state))}" + (f" · {stats}" if stats else "")
+
+
+def commit_line(p: Project | None, *rev: str) -> str:
+    h, _, rest = out(p, "git", "log", "-1", "--format=%h%x09%s%x09%cr", *rev).partition("\t")
+    subject, _, when = rest.partition("\t")
+    return f"<code>{h}</code> {html.escape(subject)}" + (f" · {ru_status(when)}" if when else "")
 
 
 def project_status(p: Project, stats: dict[str, str]) -> str:
     sh(p, "git", "fetch", "-q")
     behind = out(p, "git", "rev-list", "--count", "HEAD..@{u}")
-    lines = [f"<b>{p.name}</b> {html.escape(out(p, 'git', 'log', '-1', '--format=%h %s (%cr)'))}",
-             f"Новых коммитов: {behind}, нажмите «{UPDATE}»" if behind not in ("", "0") else "Последняя версия"]
+    lines = [f"📦 <b>{p.name}</b>", commit_line(p),
+             f"⬆️ Новых коммитов: {behind}, нажмите «{UPDATE}»" if behind not in ("", "0") else "✅ Последняя версия"]
     if not p.is_self:
-        for c in containers(p) or [{"Service": "?", "State": "docker compose не ответил"}]:
-            icon = "🟢" if c.get("State") == "running" and "unhealthy" not in c.get("Status", "") else "🔴"
-            extra = stats.get(c.get("Name", ""), "")
-            lines.append(f"{icon} {c.get('Service')} — {html.escape(c.get('Status') or c.get('State', ''))}"
-                         + (f" · {html.escape(extra)}" if extra else ""))
+        for c in containers(p) or [{"Service": "?", "State": "?", "Status": "docker compose не ответил"}]:
+            lines.append(container_line(c.get("Service", "?"), c.get("State", ""), c.get("Status", ""), stats.get(c.get("Name", ""), "")))
     return "\n".join(lines)
 
 
+def meminfo() -> dict[str, int]:
+    """/proc/meminfo in bytes."""
+    rows = (line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    return {k: int(v.split()[0]) * 1024 for k, v in rows}
+
+
+def bar(fraction: float) -> str:
+    n = min(10, round(fraction * 10))
+    return "▰" * n + "▱" * (10 - n)
+
+
+def resources_line() -> str:
+    mem, disk = meminfo(), shutil.disk_usage("/")
+    used = mem["MemTotal"] - mem["MemAvailable"]
+    return f"💾 Память {gb(used)} из {gb(mem['MemTotal'])} ГБ · диск {gb(disk.used)} из {gb(disk.total)} ГБ"
+
+
 def status_text() -> str:
-    stats = {}
-    first = next(iter(PROJECTS.values()))
-    ok, text = sh(first, "docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
-    for row in text.splitlines()[1:] if ok else []:
-        name, *rest = row.split("\t")
-        stats[name] = " · ".join(rest)
-    blocks = [f"🖥 <b>{html.escape(SERVER)}</b>"] + [project_status(p, stats) for p in PROJECTS.values()]
-    mem = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
-    total, avail = (int(mem[k].split()[0]) * 1024 for k in ("MemTotal", "MemAvailable"))
-    disk = shutil.disk_usage("/")
-    blocks.append(f"<b>Ресурсы</b> память {gb(total - avail)} из {gb(total)} ГБ, диск {gb(disk.used)} из {gb(disk.total)} ГБ")
+    stats = docker_stats()
+    blocks = [f"🖥 <b>{html.escape(SERVER)}</b>"] + [project_status(p, stats) for p in PROJECTS.values()] + [resources_line()]
     return "\n\n".join(blocks)
+
+
+def docker_text() -> str:
+    ok, text = sh(None, "docker", "ps", "--all", "--format", "json")
+    if not ok:
+        return f"🐳 Docker не ответил:\n<pre>{html.escape(text[-1500:])}</pre>"
+    rows = [json.loads(line) for line in text.splitlines()[1:] if line.startswith("{")]
+    stats, groups = docker_stats(), {}
+    for c in rows:
+        project = re.search(r"com\.docker\.compose\.project=([^,]+)", c.get("Labels", ""))
+        groups.setdefault(project[1] if project else "без compose", []).append(c)
+    running = sum(c.get("State") == "running" for c in rows)
+    lines = [f"🐳 <b>Docker</b> · {html.escape(SERVER)}", f"Работают {running} из {len(rows)}"]
+    for name, cs in sorted(groups.items()):
+        lines.append(f"\n📦 <b>{html.escape(name)}</b>")
+        for c in cs:
+            lines.append(container_line(c.get("Names", "?"), c.get("State", ""), c.get("Status", ""), stats.get(c.get("Names", ""), "")))
+            lines.append(f"      <i>{html.escape(c.get('Image', ''))}</i>")
+    ok, text = sh(None, "docker", "system", "df", "--format", "json")
+    names = {"Images": "Образы", "Containers": "Контейнеры", "Local Volumes": "Тома", "Build Cache": "Кэш сборки"}
+    df = [json.loads(line) for line in text.splitlines()[1:] if line.startswith("{")] if ok else []
+    if df:
+        lines.append("\n💽 <b>Docker на диске</b>")
+        lines += [f"{names.get(r.get('Type'), r.get('Type'))}: {ru_size(r.get('Size', '?'))}, можно освободить {ru_size(r.get('Reclaimable', '?'))}"
+                  for r in df]
+    return "\n".join(lines)
+
+
+def server_text() -> str:
+    mem, disk = meminfo(), shutil.disk_usage("/")
+    cores, load = os.cpu_count() or 1, os.getloadavg()
+    used = mem["MemTotal"] - mem["MemAvailable"]
+    lines = [f"🖥 <b>{html.escape(SERVER)}</b> · без перезагрузки {uptime(float(Path('/proc/uptime').read_text().split()[0]))}", "",
+             f"⚙️ <b>Процессор</b> {cores} ядер, нагрузка {' · '.join(num(x) for x in load)}"
+             + (" — <b>выше числа ядер</b>" if load[0] > cores else ""),
+             f"🧠 <b>Память</b> {bar(used / mem['MemTotal'])} {gb(used)} из {gb(mem['MemTotal'])} ГБ"]
+    if mem.get("SwapTotal"):
+        swap = mem["SwapTotal"] - mem["SwapFree"]
+        lines.append(f"🔁 <b>Swap</b> {bar(swap / mem['SwapTotal'])} {gb(swap)} из {gb(mem['SwapTotal'])} ГБ")
+    lines.append(f"💽 <b>Диск /</b> {bar(disk.used / disk.total)} {gb(disk.used)} из {gb(disk.total)} ГБ")
+    ok, text = sh(None, "ps", "-eo", "rss=,comm=", "--sort=-rss")
+    top = [row.split(None, 1) for row in text.splitlines()[1:6]] if ok else []
+    if top:
+        rows = "\n".join(f"{ru_size(f'{int(rss) / 1024:.1f}MiB')} {html.escape(name)}" for rss, name in top if rss.isdigit())
+        lines.append(f"\n<b>Больше всего памяти</b>\n<blockquote expandable>{rows}</blockquote>")
+    return "\n".join(lines)
 
 
 def logs_text(p: Project, tail: int = 2000) -> str:
@@ -203,10 +322,6 @@ def logs_text(p: Project, tail: int = 2000) -> str:
 
 
 # ---------- actions ----------
-
-def show_status(chat: int) -> None:
-    send(chat, status_text())
-
 
 def show_logs(chat: int, p: Project) -> None:
     text = logs_text(p)
@@ -216,9 +331,11 @@ def show_logs(chat: int, p: Project) -> None:
 
 def ask_update(chat: int, p: Project) -> None:
     sh(p, "git", "fetch", "-q")
-    commits = out(p, "git", "log", "--format=%h %s", "HEAD..@{u}")
+    commits = out(p, "git", "log", "--format=%h %s", "HEAD..@{u}").splitlines()
     if commits:
-        send(chat, f"<b>{p.name}: новые коммиты</b>\n{html.escape(commits)}", [("Обновить", f"do:update:{p.name}"), ("Отмена", "cancel")])
+        rows = "\n".join(f"<code>{h}</code> {html.escape(subject)}" for h, _, subject in (c.partition(" ") for c in commits))
+        send(chat, f"📦 <b>{p.name}</b>: новых коммитов {len(commits)}\n<blockquote expandable>{rows}</blockquote>",
+             [("Обновить", f"do:update:{p.name}"), ("Отмена", "cancel")])
     elif p.is_self:
         send(chat, "Бот деплоя уже последней версии.")
     else:
@@ -254,7 +371,7 @@ def update(chat: int, message_id: int, p: Project) -> None:
         log += more
         if ok and not wait_healthy(p):
             ok, log = False, log + f"\nПосле запуска не работает: {', '.join(p.check) or 'ни один контейнер'}\n"
-    version = html.escape(out(p, "git", "log", "-1", "--format=%h %s"))
+    version = commit_line(p)
     if ok:
         edit(chat, message_id, f"✅ {p.name} обновлён за {duration(time.time() - started)}\n{version}")
     else:
@@ -296,6 +413,7 @@ def in_background(chat: int, fn, *args) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
+VIEWS = {STATUS: status_text, DOCKER: docker_text, HOST: server_text}
 ASK = {UPDATE: ask_update, LOGS: show_logs, RESTART: ask_restart}  # need a project
 JOBS = {"update": update, "restart": restart}
 
@@ -316,8 +434,8 @@ def handle(u: dict) -> None:
         if m["from"]["id"] not in ADMINS or m["chat"]["type"] != "private":
             return
         chat, text = m["chat"]["id"], m.get("text", "")
-        if text == STATUS:
-            in_background(chat, show_status, chat)
+        if text in VIEWS:
+            in_background(chat, lambda: send(chat, VIEWS[text]()))
         elif text in ASK:
             in_background(chat, choose, chat, text)
         else:
