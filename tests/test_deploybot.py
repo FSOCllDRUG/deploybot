@@ -127,6 +127,16 @@ def test_self_update_restarts_the_bot(server, monkeypatch):
     deploybot.update(1, 5, server.project)
     assert server.calls() == [] and exits == [0]  # git only, no docker
 
+    # The new process greets the chat that pressed «Обновить», once, with the news and /start.
+    assert json.loads(deploybot.STATE.with_name("restarted.json").read_text())["chat"] == 1
+    deploybot.announce_restart()
+    text = server.sent[-1][1]
+    assert text.startswith("✅ Бот деплоя обновился") and "Bot fix" in text and "/start" in text
+    assert server.sent[-1][2] is None  # sent with the reply keyboard, so the buttons refresh too
+    sent = len(server.sent)
+    deploybot.announce_restart()
+    assert len(server.sent) == sent
+
 
 def test_several_projects_ask_which_one(server, monkeypatch, tmp_path):
     other = Project("blog", tmp_path)

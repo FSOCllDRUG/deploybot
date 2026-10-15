@@ -357,16 +357,20 @@ def view(chat: int) -> str:
         return "pretty"
 
 
+def write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)  # atomic: a crash never leaves half a file
+
+
 def set_view(chat: int, mode: str) -> None:
     try:
         data = json.loads(STATE.read_text())
     except (OSError, ValueError):
         data = {}
     data[str(chat)] = mode
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.replace(STATE)  # atomic: a crash never leaves half a file
+    write_json(STATE, data)
 
 
 def ask_view(chat: int) -> None:
@@ -441,6 +445,7 @@ def update(chat: int, message_id: int, p: Project) -> None:
         send_file(chat, f"{p.name}-update-{stamp()}.txt", log + ("" if p.is_self else "\n\n===== логи после обновления =====\n" + logs_text(p, 200)))
     if ok and p.is_self and changed:
         send(chat, "Бот деплоя перезапускается с новым кодом, через несколько секунд он снова на связи.")
+        write_json(STATE.with_name("restarted.json"), {"chat": chat, "from": before})  # the new code reports back
         os._exit(0)  # systemd (Restart=always) starts the new code
 
 
@@ -526,10 +531,34 @@ def handle(u: dict) -> None:
             edit(chat, message_id, "Отменено")
 
 
+def announce_restart() -> None:
+    """After a self-update: tell the chat that pressed «Обновить» the new code is up, with fresh buttons."""
+    path = STATE.with_name("restarted.json")
+    try:
+        note = json.loads(path.read_text())
+        path.unlink()  # first, so a failing send can't repeat on every start
+    except (OSError, ValueError):
+        return
+    me = Project("deploybot", HERE)
+    ok, log = sh(me, "git", "log", "--oneline", f"{note['from']}..HEAD")
+    commits = log.splitlines()[1:] if ok else []
+    if view(note["chat"]) == "raw":
+        news = pre(log) if commits else ""
+    else:
+        rows = "\n".join(f"<code>{h}</code> {html.escape(subject)}" for h, _, subject in (c.partition(" ") for c in commits))
+        news = f"<blockquote expandable>{rows}</blockquote>" if rows else ""
+    send(note["chat"], f"✅ Бот деплоя обновился и снова на связи\n{commit_line(me)}\n{news}\n"
+                       "Кнопки внизу обновлены. Если их не видно или они старые, нажмите /start")
+
+
 def main() -> None:
     global TOKEN, ADMINS, PROJECTS, SERVER
     TOKEN, ADMINS, PROJECTS, SERVER = load()
     api("setMyCommands", {"commands": [{"command": "start", "description": "Кнопки управления"}]})
+    try:
+        announce_restart()
+    except Exception:
+        traceback.print_exc()
     print(f"deploybot on {SERVER}: projects {list(PROJECTS)}, admins {sorted(ADMINS)}", flush=True)
     offset = 0
     while True:
