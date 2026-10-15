@@ -1,0 +1,9 @@
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+
+__pycache__/
+.pytest_cache/
+# the real config holds the bot token
+projects.ini
